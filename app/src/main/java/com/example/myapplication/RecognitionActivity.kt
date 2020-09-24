@@ -1,0 +1,267 @@
+package com.example.myapplication
+
+import android.graphics.Bitmap
+import android.os.Bundle
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
+import android.util.Log
+import android.widget.Toast
+import androidx.appcompat.app.AppCompatActivity
+import com.google.android.gms.tasks.Task
+import com.google.android.gms.tasks.Tasks
+import com.google.firebase.ml.common.FirebaseMLException
+import com.google.firebase.ml.custom.*
+import com.google.firebase.ml.vision.common.FirebaseVisionImage
+import com.google.firebase.ml.vision.common.FirebaseVisionImageMetadata
+import com.otaliastudios.cameraview.CameraView
+import com.otaliastudios.cameraview.Frame
+import kotlinx.android.synthetic.main.activity_recognition.*
+import java.io.BufferedReader
+import java.io.IOException
+import java.io.InputStreamReader
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.util.*
+import kotlin.Comparator
+import kotlin.collections.HashMap
+import kotlin.experimental.and
+
+class RecognitionActivity : AppCompatActivity() {
+    lateinit var mTTS: TextToSpeech
+    private val TAG = "Realtime"
+    private val isQuant: Boolean = false
+    private val FLOAT_VALUE = 4
+    private val QUANT_VALUE = 1
+    private val LABEL_PATH = "labels.txt"
+    private val DIM_BATCH_SIZE = 1
+    private val DIM_PIXEL_SIZE = 3
+    private val DIM_IMG_SIZE_X = 224
+    private val DIM_IMG_SIZE_Y = 224
+    private val intValues = IntArray(DIM_IMG_SIZE_X * DIM_IMG_SIZE_Y)
+    private val RESULTS_TO_SHOW = 3
+    private var sortedLabels =
+        PriorityQueue<AbstractMap.SimpleEntry<String, Float>>(RESULTS_TO_SHOW,
+            Comparator<AbstractMap.SimpleEntry<String, Float>> { o1, o2 -> o1.value.compareTo(o2.value) })
+    private lateinit var labelList: List<String>
+    private var interpreter: FirebaseModelInterpreter? = null
+    private var dataOptions: FirebaseModelInputOutputOptions? = null
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_recognition)
+        mTTS = TextToSpeech(applicationContext, TextToSpeech.OnInitListener { status ->
+            if (status != TextToSpeech.ERROR) {
+                val result=mTTS.setLanguage(Locale("tr"))
+            }
+        },"com.google.android.tts")
+        initFirebase()
+
+
+        cameraView.setLifecycleOwner(this)
+
+        mTTS.setOnUtteranceProgressListener(object : UtteranceProgressListener(){
+            override fun onDone(utteranceId: String?) {
+                Thread.sleep(2_000)
+                Log.d("sea","ondone")
+                getFrameProcessor()
+            }
+
+            override fun onError(utteranceId: String?) {
+                Log.d("sea","onerror")
+            }
+
+            override fun onStart(utteranceId: String?) {
+                Log.d("sea","onstart")
+            }
+        })
+
+        getFrameProcessor()
+    }
+    private fun getFrameProcessor() {
+        var toSpeak = "nothing"
+        var map : HashMap<String, String> = HashMap<String,String>()
+        map.put(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID,"UniqueID")
+        cameraView.addFrameProcessor {
+            classifyFrame(it)?.addOnSuccessListener { result ->
+                var index = result[2].indexOf(":")
+                toSpeak = result[2].substring(0,index)
+                txtDetectedObject3.text = toSpeak
+                cameraView.clearFrameProcessors()
+                toSpeak = txtDetectedObject3.text.toString()
+
+                mTTS.speak(toSpeak, TextToSpeech.QUEUE_FLUSH, map)
+
+            }
+        }
+    }
+    private fun initFirebase() {
+        labelList = loadLabelList()
+        try {
+
+            val remoteModel = FirebaseCustomRemoteModel.Builder("yeni-model").build()
+            val modelOptions = FirebaseModelInterpreterOptions.Builder(remoteModel).build()
+            interpreter = FirebaseModelInterpreter.getInstance(modelOptions)
+            val inputDims =
+                intArrayOf(DIM_BATCH_SIZE, DIM_IMG_SIZE_X, DIM_IMG_SIZE_Y, DIM_PIXEL_SIZE)
+            val outputDims = intArrayOf(1, labelList.size)
+            val dataType = if (isQuant) {
+                FirebaseModelDataType.BYTE
+            } else {
+                FirebaseModelDataType.FLOAT32
+            }
+            dataOptions = FirebaseModelInputOutputOptions.Builder()
+                .setInputFormat(0, dataType, inputDims)
+                .setOutputFormat(0, dataType, outputDims)
+                .build()
+        } catch (e: FirebaseMLException) {
+            Toast.makeText(this, "Error while setting up the model", Toast.LENGTH_LONG)
+        }
+    }
+
+    private fun classifyFrame(frame: Frame): Task<List<String>>? {
+        val firebaseVisionImage = getVisionImageFromFrame(frame)
+        val bitmap = firebaseVisionImage.bitmap
+        if (interpreter == null) {
+            Log.e(TAG, "Image classifier has not been initialized; Skipped.")
+            val uninitialized = ArrayList<String>()
+            uninitialized.add("Uninitialized Classifier.")
+            Tasks.forResult<List<String>>(uninitialized)
+        }
+        val imgData = convertBitmapToByteBuffer(bitmap)
+        val inputs = FirebaseModelInputs.Builder().add(imgData).build()
+        return runInterpreter(inputs)
+    }
+
+    private fun runInterpreter(inputs: FirebaseModelInputs): Task<List<String>> {
+        val result = dataOptions?.let {
+            interpreter!!.run(inputs, it).addOnFailureListener { e ->
+                Log.e(TAG, "Failed to get labels array: ${e.message}")
+                e.printStackTrace()
+            }
+                .continueWith { task ->
+                    if (isQuant) {
+                        val labelProbArray = task.result!!.getOutput<Array<ByteArray>>(0)
+                        getTopLabels(labelProbArray)
+                    } else {
+                        val labelProbArray = task.result!!.getOutput<Array<FloatArray>>(0)
+                        getTopLabels(labelProbArray)
+                    }
+                }
+        }
+        return result!!
+    }
+
+    private fun getTopLabels(labelProbArray: Array<FloatArray>): List<String> {
+
+        for (i in labelList.indices) {
+            sortedLabels.add(
+                AbstractMap.SimpleEntry(labelList[i], labelProbArray[0][i])
+            )
+            if (sortedLabels.size > RESULTS_TO_SHOW) {
+                sortedLabels.poll()
+            }
+        }
+        val result = ArrayList<String>()
+        val size = sortedLabels.size
+        for (i in 0 until size) {
+            val label = sortedLabels.poll()
+            if (label != null) {
+                result.add(label.key + ":" + label.value)
+            }
+        }
+        Log.d(TAG, "labels: $result")
+
+        return result
+    }
+
+    private fun getTopLabels(labelProbArray: Array<ByteArray>): List<String> {
+        for (i in labelList.indices) {
+            sortedLabels.add(
+                AbstractMap.SimpleEntry(
+                    labelList[i],
+                    (labelProbArray[0][i] and 0xff.toByte()) / 255.0f
+                )
+            )
+            if (sortedLabels.size > RESULTS_TO_SHOW) {
+                sortedLabels.poll()
+            }
+        }
+        val result = ArrayList<String>()
+        val size = sortedLabels.size
+        for (i in 0 until size) {
+            val label = sortedLabels.poll()
+            if (label != null) {
+                result.add(label.key + ":" + label.value)
+            }
+        }
+        Log.d(TAG, "labels: $result")
+        return result
+    }
+
+    private fun convertBitmapToByteBuffer(bitmap: Bitmap): ByteBuffer {
+        val value = if (isQuant) {
+            QUANT_VALUE
+        } else {
+            FLOAT_VALUE
+        }
+        val imgData = ByteBuffer.allocateDirect(
+            value * DIM_BATCH_SIZE * DIM_IMG_SIZE_X * DIM_IMG_SIZE_Y * DIM_PIXEL_SIZE
+        )
+        imgData.order(ByteOrder.nativeOrder())
+        val scaledBitmap = Bitmap.createScaledBitmap(
+            bitmap, DIM_IMG_SIZE_X, DIM_IMG_SIZE_Y, true
+        )
+        imgData.rewind()
+        scaledBitmap.getPixels(
+            intValues, 0, scaledBitmap.width, 0, 0, scaledBitmap.width,
+            scaledBitmap.height
+        )
+        var pixel = 0
+        for (i in 0 until DIM_IMG_SIZE_X) {
+            for (j in 0 until DIM_IMG_SIZE_Y) {
+                val intValue = intValues[pixel++]
+                if (isQuant) {
+                    imgData.put((intValue shr 16 and 0xFF).toByte())
+                    imgData.put((intValue shr 8 and 0xFF).toByte())
+                    imgData.put((intValue and 0xFF).toByte())
+                } else {
+                    imgData.putFloat((intValue shr 16 and 0xFF) / 255.0f)
+                    imgData.putFloat((intValue shr 8 and 0xFF) / 255.0f)
+                    imgData.putFloat((intValue and 0xFF) / 255.0f)
+                }
+            }
+        }
+        return imgData
+    }
+
+    private fun getVisionImageFromFrame(frame: Frame): FirebaseVisionImage {
+        val data = frame.data
+        val imageMetaData = FirebaseVisionImageMetadata.Builder()
+            .setFormat(FirebaseVisionImageMetadata.IMAGE_FORMAT_NV21)
+            .setRotation(FirebaseVisionImageMetadata.ROTATION_90)
+            .setWidth(frame.size.width)
+            .setHeight(frame.size.height)
+            .build()
+        return FirebaseVisionImage.fromByteArray(data, imageMetaData)
+    }
+
+    private fun loadLabelList(): List<String> {
+        val labelList = ArrayList<String>()
+        try {
+            BufferedReader(InputStreamReader(this.assets.open(LABEL_PATH))).use { reader ->
+                var line = reader.readLine()
+                while (line != null) {
+                    labelList.add(line)
+                    line = reader.readLine()
+                }
+            }
+        } catch (e: IOException) {
+            Log.e(TAG, "Failed to read label list.", e)
+        }
+        return labelList
+    }
+}
+
+private fun CameraView.removeFrameProcessor(text: String) {
+
+}

@@ -1,0 +1,7 @@
+kapı
+kitaplık
+koltuk
+masa
+sandalye
+tekerlekli sandalye
+yatak
